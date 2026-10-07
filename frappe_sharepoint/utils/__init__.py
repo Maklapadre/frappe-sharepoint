@@ -127,7 +127,7 @@ def make_request(request, url, headers, body=None):
             frappe.logger().info(f"[API Request] Making DELETE request")
             response = requests.delete(url, headers=headers, timeout=timeout)
         elif request == "PUT":
-            frappe.logger().info(f"[API Request] Making PUT request with binary body (size: {len(body) if body else 0} bytes)")
+            frappe.logger().info("[API Request] Making PUT request with binary body")
             response = requests.put(url, headers=headers, data=body, timeout=timeout)
         else:
             frappe.logger().error(f"[API Request] Unsupported request method: {request}")
