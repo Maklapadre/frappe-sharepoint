@@ -17,7 +17,9 @@ from frappe.core.doctype.file.file import File
 
 from frappe_sharepoint import utils
 from frappe_sharepoint.controllers.file_controller import file_upload, get_file_path
-from frappe_sharepoint.utils.sharepoint import SharePoint, trigger_sharepoint_upload
+from frappe_sharepoint.utils.sharepoint import (
+	SharePoint, resolve_document_reference, trigger_sharepoint_upload, upload_document_bundle,
+)
 
 
 def graph_response(status=201, size=0, **values):
@@ -50,6 +52,7 @@ class TestUploads(unittest.TestCase):
 			get_password=lambda name: "test-secret",
 		)
 		self.db = Mock()
+		self.db.get_value.return_value = None
 		for target, value in (
 			("frappe.db", self.db),
 			("frappe.session", SimpleNamespace(user="Administrator")),
@@ -57,6 +60,7 @@ class TestUploads(unittest.TestCase):
 			("frappe.log_error", Mock()),
 			("frappe.get_doc", Mock(return_value=self.file)),
 			("frappe.get_single", Mock(return_value=self.settings)),
+			("frappe.get_hooks", Mock(return_value=[])),
 			("frappe_sharepoint.utils.sharepoint.get_request_header", Mock(return_value={})),
 		):
 			patcher = patch(target, value)
@@ -109,7 +113,7 @@ class TestUploads(unittest.TestCase):
 			def put(url, headers, data, timeout):
 				streams.append(data)
 				self.assertFalse(data.closed)
-				self.assertTrue(url.endswith("/invoice_12ab34.pdf:/content"))
+				self.assertTrue(url.endswith("/invoice.pdf:/content"))
 				self.assertEqual(data.read(), self.content)
 				return graph_response(size=len(self.content))
 			with patch("requests.put", side_effect=put):
@@ -127,6 +131,7 @@ class TestUploads(unittest.TestCase):
 			trigger_sharepoint_upload("Old", "Old", "/old", "FILE-1")
 			sharepoint.assert_called_once_with(
 				doctype="Communication", docname="COMM-1", filepath=str(self.path), filedoc="FILE-1",
+				filename="invoice.pdf",
 			)
 
 	def test_missing_local_file_fails_job_without_remote_calls_or_success_flag(self):
@@ -231,6 +236,104 @@ class TestUploads(unittest.TestCase):
 			sharepoint = SharePoint()
 			with self.assertRaises(RuntimeError):
 				sharepoint.get_or_create_folder("parent", "Communication")
+			create.assert_not_called()
+
+	def test_communication_resolves_primary_reference_and_handles_unlinked_email(self):
+		for reference in (None, frappe._dict(reference_doctype="Purchase Order")):
+			self.db.get_value.return_value = reference
+			self.assertEqual(resolve_document_reference("Communication", "COMM-1"), ("Communication", "COMM-1"))
+		self.db.get_value.return_value = frappe._dict(reference_doctype="Purchase Order", reference_name="PO-12150R")
+		self.assertEqual(resolve_document_reference("Communication", "COMM-1"), ("Purchase Order", "PO-12150R"))
+		self.db.get_value.assert_called_with(
+			"Communication", "COMM-1", ["reference_doctype", "reference_name"], as_dict=True,
+		)
+
+	def test_communication_chain_and_cycle(self):
+		self.db.get_value.side_effect = [
+			frappe._dict(reference_doctype="Communication", reference_name="COMM-2"),
+			frappe._dict(reference_doctype="Sales Order", reference_name="SO-1"),
+		]
+		self.assertEqual(resolve_document_reference("Communication", "COMM-1"), ("Sales Order", "SO-1"))
+		self.db.get_value.side_effect = None
+		self.db.get_value.return_value = frappe._dict(reference_doctype="Communication", reference_name="COMM-1")
+		with self.assertRaisesRegex(ValueError, "Circular"):
+			resolve_document_reference("Communication", "COMM-1")
+
+	def test_app_routing_overrides_flat_for_worker_and_bundle(self):
+		self.settings.folder_structure = "Flat"
+		self.db.get_value.return_value = frappe._dict(reference_doctype="Purchase Order", reference_name="PO-12150R")
+		frappe.get_hooks.return_value = ["test.folder_resolver"]
+		resolver = Mock(return_value="Purchase Orders")
+		with patch("frappe.get_attr", return_value=resolver), \
+			patch.object(SharePoint, "get_root_folder_id", return_value="documents"), \
+			patch.object(SharePoint, "get_or_create_folder", return_value="purchase-orders") as folder, \
+			patch.object(SharePoint, "get_folder_url", return_value="https://sharepoint.test/purchase-orders"), \
+			patch("requests.put", return_value=graph_response(size=len(self.content))) as put:
+			trigger_sharepoint_upload(filedoc="FILE-1")
+			result = upload_document_bundle("Communication", "COMM-1", [
+				{"filepath": str(self.path), "filename": "invoice.pdf"},
+			])
+			self.assertTrue(result["success"])
+			self.assertEqual(resolver.call_count, 2)
+			resolver.assert_called_with("Purchase Order")
+			self.assertEqual(folder.call_count, 2)
+			folder.assert_called_with("documents", "Purchase Orders")
+			for call in put.call_args_list:
+				self.assertTrue(call.args[0].endswith("/purchase-orders:/invoice.pdf:/content"))
+
+	def test_without_app_routing_existing_folder_settings_still_apply(self):
+		self.db.get_value.return_value = "Buying"
+		with patch.object(SharePoint, "get_root_folder_id", return_value="root"), \
+			patch.object(SharePoint, "get_or_create_folder", side_effect=["module", "doctype", "document"]) as folder:
+			self.settings.folder_structure = "Flat"
+			self.assertEqual(SharePoint(doctype="Purchase Order", docname="PO-1").build_folder_structure(), "root")
+			folder.assert_not_called()
+			self.settings.folder_structure = "Module/DocType/Document"
+			self.assertEqual(SharePoint(doctype="Purchase Order", docname="PO-1").build_folder_structure(), "document")
+			self.assertEqual([call.args for call in folder.call_args_list], [
+				("root", "Buying"), ("module", "Purchase Order"), ("doctype", "PO-1"),
+			])
+
+	def test_new_file_versions_replace_one_remote_name_and_keep_local_bytes(self):
+		remote = {}
+		def put(url, headers, data, timeout):
+			content = data.read()
+			status = 200 if url in remote else 201
+			remote[url] = content
+			return graph_response(status=status, size=len(content))
+		self.file.file_name = "PO-12150R_Jinda.pdf"
+		with patch.object(SharePoint, "build_folder_structure", return_value="purchase-orders"), \
+			patch("requests.put", side_effect=put):
+			for suffix, content in (("735b99025eee", b"first PDF"), ("abcd12345678", b"revised PDF")):
+				path = self.root / f"PO-12150R_Jinda-{suffix}.pdf"
+				path.write_bytes(content)
+				self.file.name = f"FILE-{suffix}"
+				self.file.get_full_path.return_value = str(path)
+				trigger_sharepoint_upload(filedoc=self.file.name)
+				self.assertEqual(path.read_bytes(), content)
+		self.assertEqual(remote, {
+			"https://graph.test/v1.0/drives/drive/items/purchase-orders:/PO-12150R_Jinda.pdf:/content": b"revised PDF",
+		})
+
+	def test_folder_lookup_uses_exact_path_instead_of_first_page_of_children(self):
+		with patch("frappe_sharepoint.utils.sharepoint.make_request", return_value=graph_response(status=200, folder={})) as request, \
+			patch.object(SharePoint, "get_sharepoint_folder_items", side_effect=AssertionError("Paginated listing")):
+			self.assertEqual(SharePoint().get_or_create_folder("parent", "Purchase Orders"), "remote-file")
+			self.assertEqual(request.call_args.args[:2], (
+				"GET", "https://graph.test/v1.0/drives/drive/items/parent:/Purchase%20Orders",
+			))
+
+	def test_concurrent_folder_creation_reuses_winner_without_renaming(self):
+		responses = [graph_response(status=404), graph_response(status=409), graph_response(status=200, folder={})]
+		with patch("frappe_sharepoint.utils.sharepoint.make_request", side_effect=responses) as request:
+			self.assertEqual(SharePoint().get_or_create_folder("parent", "Purchase Orders"), "remote-file")
+			self.assertEqual(request.call_args_list[1].args[3]["@microsoft.graph.conflictBehavior"], "fail")
+
+	def test_folder_path_conflicting_with_file_fails_without_creating_folder(self):
+		with patch("frappe_sharepoint.utils.sharepoint.make_request", return_value=graph_response(status=200)), \
+			patch.object(SharePoint, "create_sharepoint_folder") as create:
+			with self.assertRaisesRegex(RuntimeError, "not a folder"):
+				SharePoint().get_or_create_folder("parent", "Purchase Orders")
 			create.assert_not_called()
 
 

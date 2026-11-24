@@ -15,6 +15,22 @@ SETTINGS = "SharePoint Settings"
 ContentType = {"Content-Type": "application/json"}
 
 
+def resolve_document_reference(doctype, docname):
+	"""Route Communication files by their primary business reference, with cycle protection."""
+	seen = set()
+	while doctype == "Communication" and docname:
+		if docname in seen:
+			raise ValueError("Circular Communication reference in SharePoint upload")
+		seen.add(docname)
+		reference = frappe.db.get_value(
+			"Communication", docname, ["reference_doctype", "reference_name"], as_dict=True
+		)
+		if not reference or not reference.reference_doctype or not reference.reference_name:
+			break
+		doctype, docname = reference.reference_doctype, reference.reference_name
+	return doctype, docname
+
+
 def trigger_sharepoint_upload(doctype=None, docname=None, filepath=None, filedoc=None):
 	"""Reload the committed File; legacy queued arguments must not override it."""
 	if not filedoc:
@@ -33,6 +49,7 @@ def trigger_sharepoint_upload(doctype=None, docname=None, filepath=None, filedoc
 		docname=file.attached_to_name,
 		filepath=get_file_path(file),
 		filedoc=file.name,
+		filename=file.file_name,
 	)
 	return sharepoint.run_sharepoint_upload()
 
@@ -136,10 +153,10 @@ def upload_document_bundle(doctype, docname, files):
 class SharePoint(object):
 	def __init__(self, **kwargs):
 		self.user = frappe.session.user
-		self.doctype = kwargs.get("doctype")
-		self.docname = kwargs.get("docname")
+		self.doctype, self.docname = resolve_document_reference(kwargs.get("doctype"), kwargs.get("docname"))
 		self.filepath = kwargs.get("filepath")
 		self.filedoc = kwargs.get("filedoc")
+		self.filename = kwargs.get("filename")
 		self.settings = frappe.get_single(SETTINGS)
 		
 		# Validate required settings
@@ -183,12 +200,18 @@ class SharePoint(object):
 		body = {
 			"name": f'{folder_name}',
 			"folder": {},
-			"@microsoft.graph.conflictBehavior": "rename"
+			"@microsoft.graph.conflictBehavior": "fail"
 		}
 
 		response = make_request('POST', url, headers, body)
 		frappe.logger().info(f"[Create Folder] Response status: {response.status_code if response else 'None'}")
 		
+		# Another worker may have created the same folder after our lookup.
+		if response.status_code == 409:
+			folder_id = self.get_folder_id_by_name(parent_folder_id, folder_name)
+			if folder_id:
+				return folder_id
+
 		if not response.ok:
 			frappe.logger().error(f"[Create Folder] Failed to create '{folder_name}': {response.text if response else 'No response'}")
 			raise RuntimeError(f"SharePoint folder creation failed ({response.status_code})")
@@ -198,16 +221,18 @@ class SharePoint(object):
 			return folder_id
 
 	def get_folder_id_by_name(self, parent_folder_id, folder_name):
-		'''
-			Get folder ID by name within a parent folder
-		'''
-		folder_id = None
-		folder_items = self.get_sharepoint_folder_items(parent_folder_id)
-		for item in folder_items:
-			if folder_name == item['name']:
-				folder_id = item['id']
-				break
-		return folder_id
+		"""Look up the exact folder path, including in parents with paginated children."""
+		headers = get_request_header(self.settings)
+		url = f'{self.base_url}/items/{parent_folder_id}:/{quote(folder_name, safe="")}'
+		response = make_request("GET", url, headers, None)
+		if response.status_code == 404:
+			return None
+		if response.status_code != 200:
+			raise RuntimeError(f"SharePoint folder lookup failed ({response.status_code})")
+		item = response.json()
+		if "folder" not in item or not item.get("id"):
+			raise RuntimeError(f"SharePoint path is not a folder: {folder_name}")
+		return item["id"]
 
 	def get_or_create_folder(self, parent_folder_id, folder_name):
 		'''
@@ -273,6 +298,12 @@ class SharePoint(object):
 		current_folder_id = self.get_root_folder_id()
 		frappe.logger().info(f"[Build Folders] Root folder ID: {current_folder_id}")
 
+		# Installed apps can route all upload mechanisms through their business folders.
+		for resolver in reversed(frappe.get_hooks("sharepoint_folder_name")):
+			folder_name = frappe.get_attr(resolver)(self.doctype)
+			if folder_name:
+				return self.get_or_create_folder(current_folder_id, folder_name)
+
 		if self.folder_structure == "Flat":
 			# No additional folders, upload directly to root
 			frappe.logger().info(f"[Build Folders] Using flat structure - no additional folders")
@@ -307,8 +338,8 @@ class SharePoint(object):
 
 	def run_sharepoint_upload(self):
 		"""Upload the current local file, letting errors fail the background job."""
-		if not self.filepath or not self.filedoc:
-			raise ValueError("A local file path and File document ID are required")
+		if not self.filepath or not self.filedoc or not self.filename:
+			raise ValueError("A local file path, File document ID and display filename are required")
 
 		# Open before remote operations, and close on every success/error path.
 		with open(self.filepath, "rb") as file_content:
@@ -318,7 +349,8 @@ class SharePoint(object):
 
 			headers = get_request_header(self.settings)
 			headers.update({"Content-Type": "application/octet-stream"})
-			file_name = quote(os.path.basename(self.filepath), safe="")
+			# Storage URLs contain cache/version hashes; the display name is the remote identity.
+			file_name = quote(self.filename, safe="")
 			url = f"{self.base_url}/items/{target_folder_id}:/{file_name}:/content"
 			response = make_request("PUT", url, headers, file_content)
 			item = self.confirm_upload(response, os.fstat(file_content.fileno()).st_size)

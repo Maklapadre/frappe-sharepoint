@@ -181,6 +181,12 @@ The worker reloads the File, resolves its stored URL with `get_full_path()`, and
 opens the current local file with a context manager. Old queued jobs containing
 `filepath`, `doctype`, or `docname` remain supported, but those saved values are
 ignored in favor of the current File record. Already-uploaded Files are skipped.
+The remote filename comes from `File.file_name`, while the bytes still come from
+the stored local URL. Thus a clean display name such as `PO-12150R_Jinda.pdf`
+does not inherit the `-735b99025eee` suffix from its versioned local storage path.
+Repeated uploads to the same folder and display filename replace its contents
+through Graph's PUT API. User-supplied display names are preserved; the uploader
+does not guess whether arbitrary suffixes in those names should be removed.
 Remote URL attachments are not downloaded or queued as local files; a queued File
 that later becomes remote fails with an explicit message.
 
@@ -197,6 +203,27 @@ accessibility. For copies that must retain the original ERPNext attachment URLs,
 keep **Replace File Link** disabled. Enabling it still changes the File URL and
 requires SharePoint permissions; retaining the bytes alone does not preserve old
 private URLs, whose access checks depend on a matching File record.
+
+### Shared business folder routing
+
+An installed app may register a `sharepoint_folder_name` hook: a dotted function
+path accepting a DocType and returning a folder name directly below the configured
+root, or a false value to defer. The last registered nonempty result takes
+precedence over **Folder Structure**, for both automatic File uploads and document
+bundles. Without a hook result, the configured Flat/hierarchical behavior remains.
+LabelEdge supplies this hook using its existing transaction PDF folder mapping.
+
+Communication uploads follow `reference_doctype` and `reference_name` before
+routing. Unlinked emails remain under Communication; timeline links are not used
+to guess among potentially unrelated business records. Cyclic references fail.
+Exact folder-path lookup avoids missing folders beyond the first directory page,
+and concurrent folder creation reuses the existing folder instead of renaming it.
+
+This changes future uploads only. It does not move root-level files, delete old
+hash-suffixed copies, or reset previously uploaded File flags. For historical
+cleanup, compare the intended current version before moving/removing old copies.
+When replacing an existing path, the last successful upload wins, including files
+from different records with the same display name in the same business folder.
 
 ### Regression tests
 
@@ -234,7 +261,8 @@ verification must therefore also be performed on the deployment target.
    window and Error Logs/failed jobs. Older swallowed exceptions may have left
    jobs appearing successful. Include each stored URL, current attachment target,
    local availability, upload flag, local SHA-256, expected SharePoint folder and
-   stored basename, remote item ID/hash if present, and proposed action. A zero
+   display filename (plus the legacy stored basename), remote item ID/hash if present,
+   and proposed action. A zero
    upload flag alone is not proof that the remote copy is absent.
 4. Inspect the expected remote location before changing anything. If an identical
    copy exists, reconcile its flag without uploading it again. If contents differ,
