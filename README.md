@@ -227,6 +227,13 @@ from different records with the same display name in the same business folder.
 
 ### Regression tests
 
+LabelEdge backups use `frappe_sharepoint.utils.verified_upload`: streamed small
+files, resumable 10 MiB chunks, bounded retry/recovery, final size confirmation,
+sanitized HTTP diagnostics and complete directory pagination. The transfer code
+does not log preauthenticated session URLs or attach bearer headers to them.
+Deploy the matching LabelEdge backup worker, status DocType and scheduler update
+to use this path. Its tests mock all HTTP calls and do not prove live restoration.
+
 From `apps/frappe_sharepoint`, using the bench Python environment:
 
 ```sh
